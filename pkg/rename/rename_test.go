@@ -341,6 +341,125 @@ func TestRenameSecret_PartialRecovery_SameData(t *testing.T) {
 	}
 }
 
+// dry-run on recovery path must not delete
+func TestRenameConfigMap_Recovery_DryRun_DoesNotDelete(t *testing.T) {
+	old := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "default"},
+		Data:       map[string]string{"key": "value"},
+	}
+	newAlready := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: "default"},
+		Data:       map[string]string{"key": "value"},
+	}
+	client := allowAll()
+	client.Tracker().Add(old)
+	client.Tracker().Add(newAlready)
+
+	err := renameConfigMap(client, Options{
+		OldName: "old", NewName: "new", Namespace: "default", DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// old must still exist — dry-run must not complete the delete
+	_, getErr := client.CoreV1().ConfigMaps("default").Get(ctx(), "old", metav1.GetOptions{})
+	if getErr != nil {
+		t.Error("dry-run recovery should not delete old configmap")
+	}
+}
+
+func TestRenameSecret_Recovery_DryRun_DoesNotDelete(t *testing.T) {
+	old := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "default"},
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{"k": []byte("v")},
+	}
+	newAlready := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: "default"},
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{"k": []byte("v")},
+	}
+	client := allowAll()
+	client.Tracker().Add(old)
+	client.Tracker().Add(newAlready)
+
+	err := renameSecret(client, Options{
+		OldName: "old", NewName: "new", Namespace: "default", DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, getErr := client.CoreV1().Secrets("default").Get(ctx(), "old", metav1.GetOptions{})
+	if getErr != nil {
+		t.Error("dry-run recovery should not delete old secret")
+	}
+}
+
+// old resource disappears between pre-flight and GET — must fail cleanly, nothing written
+func TestRenameConfigMap_OldDisappearsBeforeCreate(t *testing.T) {
+	// No old resource exists at all — simulates deletion mid-run
+	client := allowAll()
+
+	err := renameConfigMap(client, Options{
+		OldName: "vanished", NewName: "new", Namespace: "default", Yes: true,
+	})
+	if err == nil {
+		t.Fatal("expected error when old resource does not exist")
+	}
+
+	// new must not have been created
+	_, getErr := client.CoreV1().ConfigMaps("default").Get(ctx(), "new", metav1.GetOptions{})
+	if getErr == nil {
+		t.Error("new configmap should not have been created when old was missing")
+	}
+}
+
+func TestRenameSecret_OldDisappearsBeforeCreate(t *testing.T) {
+	client := allowAll()
+
+	err := renameSecret(client, Options{
+		OldName: "vanished", NewName: "new", Namespace: "default", Yes: true,
+	})
+	if err == nil {
+		t.Fatal("expected error when old secret does not exist")
+	}
+
+	_, getErr := client.CoreV1().Secrets("default").Get(ctx(), "new", metav1.GetOptions{})
+	if getErr == nil {
+		t.Error("new secret should not have been created when old was missing")
+	}
+}
+
+// labels/annotations difference must NOT block recovery — only data matters
+func TestRenameConfigMap_Recovery_IgnoresLabelDifference(t *testing.T) {
+	old := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: "default", Labels: map[string]string{"env": "staging"}},
+		Data:       map[string]string{"key": "value"},
+	}
+	// new has same data but a controller added a label after CREATE
+	newAlready := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: "default", Labels: map[string]string{"app.kubernetes.io/managed-by": "helm"}},
+		Data:       map[string]string{"key": "value"},
+	}
+	client := allowAll()
+	client.Tracker().Add(old)
+	client.Tracker().Add(newAlready)
+
+	err := renameConfigMap(client, Options{
+		OldName: "old", NewName: "new", Namespace: "default", Yes: true,
+	})
+	if err != nil {
+		t.Fatalf("label difference should not block recovery, got: %v", err)
+	}
+
+	_, getErr := client.CoreV1().ConfigMaps("default").Get(ctx(), "old", metav1.GetOptions{})
+	if getErr == nil {
+		t.Error("old configmap should have been deleted during recovery")
+	}
+}
+
 func TestRenameSecret_PartialRecovery_DifferentType(t *testing.T) {
 	// Same name but different type — definitely not a partial rename, must error.
 	old := &corev1.Secret{

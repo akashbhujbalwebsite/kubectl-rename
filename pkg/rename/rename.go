@@ -55,11 +55,17 @@ func renameConfigMap(client kubernetes.Interface, opts Options) error {
 	}
 
 	// Partial-rename recovery: new name already exists before we even start.
+	// Only compares data/binaryData — labels/annotations excluded deliberately so a
+	// controller modifying metadata after CREATE doesn't block recovery.
 	existing, existErr := client.CoreV1().ConfigMaps(opts.Namespace).Get(ctx, opts.NewName, metav1.GetOptions{})
 	if existErr == nil {
 		if configMapsEqual(cm, existing) {
 			fmt.Printf("⚠️  Partial rename detected: %q already exists with identical data.\n", opts.NewName)
 			fmt.Printf("   This looks like a previous rename that was interrupted after CREATE but before DELETE.\n")
+			if opts.DryRun {
+				fmt.Printf("   [dry-run] Would delete %q to complete the rename. No changes made.\n", opts.OldName)
+				return nil
+			}
 			fmt.Printf("   Completing rename by deleting %q...\n", opts.OldName)
 			if err := client.CoreV1().ConfigMaps(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
 				return fmt.Errorf("failed to complete partial rename — delete %q manually: %w", opts.OldName, err)
@@ -139,11 +145,16 @@ func renameSecret(client kubernetes.Interface, opts Options) error {
 	}
 
 	// Partial-rename recovery: new name already exists before we even start.
+	// Only compares type+data — labels/annotations excluded deliberately.
 	existing, existErr := client.CoreV1().Secrets(opts.Namespace).Get(ctx, opts.NewName, metav1.GetOptions{})
 	if existErr == nil {
 		if secretsEqual(secret, existing) {
 			fmt.Printf("⚠️  Partial rename detected: %q already exists with identical data.\n", opts.NewName)
 			fmt.Printf("   This looks like a previous rename that was interrupted after CREATE but before DELETE.\n")
+			if opts.DryRun {
+				fmt.Printf("   [dry-run] Would delete %q to complete the rename. No changes made.\n", opts.OldName)
+				return nil
+			}
 			fmt.Printf("   Completing rename by deleting %q...\n", opts.OldName)
 			if err := client.CoreV1().Secrets(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
 				return fmt.Errorf("failed to complete partial rename — delete %q manually: %w", opts.OldName, err)
