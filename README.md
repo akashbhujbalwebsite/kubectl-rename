@@ -127,12 +127,35 @@ Problems with the manual approach:
 - No confirmation → immediate destructive action
 - No dry-run → can't preview safely
 
+## Partial-failure recovery
+
+If the process is interrupted (crash, Ctrl+C, network drop) after CREATE but before DELETE, both names will exist. On the next re-run, the tool detects this automatically:
+
+```
+⚠️  Partial rename detected: "app-config-v2" already exists with identical data.
+   This looks like a previous rename that was interrupted after CREATE but before DELETE.
+   Completing rename by deleting "app-config"...
+✓ Deleted ConfigMap "app-config"
+
+Done. ConfigMap renamed: "app-config" → "app-config-v2"
+```
+
+If CREATE succeeds but DELETE fails (e.g., RBAC revoked mid-run, finalizer added):
+
+```
+⚠️  Partial rename: "app-config-v2" was created but "app-config" could not be deleted: <reason>
+   Re-run this command to finish, or manually delete "app-config"
+```
+
+Re-running the same command will detect the identical data and complete the delete step.
+
 ## Caveats
 
-- References are scanned in the specified namespace only. Cross-namespace references (e.g., a Pod in another namespace using the same ConfigMap name) are not detected.
-- The rename is not atomic — there is a brief window between CREATE and DELETE where both names exist. In practice this is milliseconds, but it is not a transaction.
-- Deployment/StatefulSet/DaemonSet pods that mount the renamed ConfigMap/Secret will use the old data until their next rollout. The tool warns you but does not trigger a rollout.
-- CRDs and other custom resources are not scanned for references in v0.1.
+- References are scanned in the specified namespace only. Cross-namespace references are not detected.
+- The rename is not atomic — there is a brief window between CREATE and DELETE where both names exist. Re-run handles this automatically (see above).
+- Deployment/StatefulSet/DaemonSet pods that mount the renamed ConfigMap/Secret will use the old data until their next rollout. The tool warns but does not trigger a rollout.
+- StatefulSets, DaemonSets, CronJobs, and CRDs are not scanned for references in v0.1.
+- init containers inside Pods and Deployments are scanned.
 
 ## Releasing a new version
 

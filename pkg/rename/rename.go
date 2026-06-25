@@ -2,12 +2,15 @@ package rename
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -51,8 +54,28 @@ func renameConfigMap(client kubernetes.Interface, opts Options) error {
 		return fmt.Errorf("configmap %q not found in namespace %q: %w", opts.OldName, opts.Namespace, err)
 	}
 
-	refs := findConfigMapRefs(client, opts.Namespace, opts.OldName)
+	// Partial-rename recovery: new name already exists before we even start.
+	existing, existErr := client.CoreV1().ConfigMaps(opts.Namespace).Get(ctx, opts.NewName, metav1.GetOptions{})
+	if existErr == nil {
+		if configMapsEqual(cm, existing) {
+			fmt.Printf("⚠️  Partial rename detected: %q already exists with identical data.\n", opts.NewName)
+			fmt.Printf("   This looks like a previous rename that was interrupted after CREATE but before DELETE.\n")
+			fmt.Printf("   Completing rename by deleting %q...\n", opts.OldName)
+			if err := client.CoreV1().ConfigMaps(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
+				return fmt.Errorf("failed to complete partial rename — delete %q manually: %w", opts.OldName, err)
+			}
+			fmt.Printf("✓ Deleted ConfigMap %q\n", opts.OldName)
+			fmt.Printf("\nDone. ConfigMap renamed: %q → %q\n", opts.OldName, opts.NewName)
+			return nil
+		}
+		return fmt.Errorf(
+			"configmap %q already exists with different data — cannot auto-resolve\n"+
+				"  Inspect both %q and %q and delete the one you don't need",
+			opts.NewName, opts.OldName, opts.NewName,
+		)
+	}
 
+	refs := findConfigMapRefs(client, opts.Namespace, opts.OldName)
 	printPlan("ConfigMap", opts, refs)
 
 	if opts.DryRun {
@@ -79,12 +102,16 @@ func renameConfigMap(client kubernetes.Interface, opts Options) error {
 	}
 
 	if _, err := client.CoreV1().ConfigMaps(opts.Namespace).Create(ctx, newCM, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("failed to create new configmap %q: %w", opts.NewName, err)
+		return fmt.Errorf("failed to create configmap %q: %w", opts.NewName, err)
 	}
 	fmt.Printf("✓ Created ConfigMap %q\n", opts.NewName)
 
 	if err := client.CoreV1().ConfigMaps(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("created %q but failed to delete old configmap %q: %w", opts.NewName, opts.OldName, err)
+		return fmt.Errorf(
+			"⚠️  Partial rename: %q was created but %q could not be deleted: %w\n"+
+				"   Re-run this command to finish, or manually delete %q",
+			opts.NewName, opts.OldName, err, opts.OldName,
+		)
 	}
 	fmt.Printf("✓ Deleted ConfigMap %q\n", opts.OldName)
 	fmt.Printf("\nDone. ConfigMap renamed: %q → %q\n", opts.OldName, opts.NewName)
@@ -111,8 +138,28 @@ func renameSecret(client kubernetes.Interface, opts Options) error {
 		return fmt.Errorf("secret %q not found in namespace %q: %w", opts.OldName, opts.Namespace, err)
 	}
 
-	refs := findSecretRefs(client, opts.Namespace, opts.OldName)
+	// Partial-rename recovery: new name already exists before we even start.
+	existing, existErr := client.CoreV1().Secrets(opts.Namespace).Get(ctx, opts.NewName, metav1.GetOptions{})
+	if existErr == nil {
+		if secretsEqual(secret, existing) {
+			fmt.Printf("⚠️  Partial rename detected: %q already exists with identical data.\n", opts.NewName)
+			fmt.Printf("   This looks like a previous rename that was interrupted after CREATE but before DELETE.\n")
+			fmt.Printf("   Completing rename by deleting %q...\n", opts.OldName)
+			if err := client.CoreV1().Secrets(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
+				return fmt.Errorf("failed to complete partial rename — delete %q manually: %w", opts.OldName, err)
+			}
+			fmt.Printf("✓ Deleted Secret %q\n", opts.OldName)
+			fmt.Printf("\nDone. Secret renamed: %q → %q\n", opts.OldName, opts.NewName)
+			return nil
+		}
+		return fmt.Errorf(
+			"secret %q already exists with different data — cannot auto-resolve\n"+
+				"  Inspect both %q and %q and delete the one you don't need",
+			opts.NewName, opts.OldName, opts.NewName,
+		)
+	}
 
+	refs := findSecretRefs(client, opts.Namespace, opts.OldName)
 	printPlan("Secret", opts, refs)
 
 	if opts.DryRun {
@@ -139,12 +186,16 @@ func renameSecret(client kubernetes.Interface, opts Options) error {
 	}
 
 	if _, err := client.CoreV1().Secrets(opts.Namespace).Create(ctx, newSecret, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("failed to create new secret %q: %w", opts.NewName, err)
+		return fmt.Errorf("failed to create secret %q: %w", opts.NewName, err)
 	}
 	fmt.Printf("✓ Created Secret %q\n", opts.NewName)
 
 	if err := client.CoreV1().Secrets(opts.Namespace).Delete(ctx, opts.OldName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("created %q but failed to delete old secret %q: %w", opts.NewName, opts.OldName, err)
+		return fmt.Errorf(
+			"⚠️  Partial rename: %q was created but %q could not be deleted: %w\n"+
+				"   Re-run this command to finish, or manually delete %q",
+			opts.NewName, opts.OldName, err, opts.OldName,
+		)
 	}
 	fmt.Printf("✓ Deleted Secret %q\n", opts.OldName)
 	fmt.Printf("\nDone. Secret renamed: %q → %q\n", opts.OldName, opts.NewName)
@@ -157,6 +208,38 @@ func renameSecret(client kubernetes.Interface, opts Options) error {
 	}
 
 	return nil
+}
+
+// configMapsEqual compares data content only — not metadata like resourceVersion.
+func configMapsEqual(a, b *corev1.ConfigMap) bool {
+	if !maps.Equal(a.Data, b.Data) {
+		return false
+	}
+	if len(a.BinaryData) != len(b.BinaryData) {
+		return false
+	}
+	for k, v := range a.BinaryData {
+		if !bytes.Equal(v, b.BinaryData[k]) {
+			return false
+		}
+	}
+	return true
+}
+
+// secretsEqual compares type + data content only — not metadata.
+func secretsEqual(a, b *corev1.Secret) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	if len(a.Data) != len(b.Data) {
+		return false
+	}
+	for k, v := range a.Data {
+		if !bytes.Equal(v, b.Data[k]) {
+			return false
+		}
+	}
+	return true
 }
 
 func printPlan(kind string, opts Options, refs []string) {
@@ -197,4 +280,9 @@ func buildClient(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, err
 	}
 	return kubernetes.NewForConfig(config)
+}
+
+// isNotFound is a convenience wrapper used in tests.
+func isNotFound(err error) bool {
+	return errors.IsNotFound(err)
 }
