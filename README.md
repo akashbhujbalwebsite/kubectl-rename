@@ -1,6 +1,6 @@
 # kubectl-rename
 
-A kubectl plugin that safely renames Kubernetes ConfigMaps and Secrets — with a pre-flight permission check, dependency scanner, and `--dry-run` mode.
+A kubectl plugin that safely renames Kubernetes ConfigMaps and Secrets — with a pre-flight permission check, dependency scanner, `--dry-run` mode, and automatic partial-failure recovery.
 
 ## Installation
 
@@ -73,13 +73,45 @@ The tool **never starts the rename** until all three permissions are confirmed. 
 ```
 1. Pre-flight check   → verify get + create + delete before touching anything
 2. GET old resource   → read all data, labels, annotations
-3. Dependency scan    → find Pods/Deployments referencing this resource (read-only)
-4. Show rename plan   → print exactly what will happen
-5. --dry-run stop     → exit here if dry-run, nothing written
-6. Confirm prompt     → ask yes/no (skip with -y)
-7. CREATE new         → new resource with same data under new name
-8. DELETE old         → remove old resource
-9. Warn about refs    → remind user which resources need manual updates
+3. Recovery check     → if new name already exists with identical data, complete the delete and exit
+4. Dependency scan    → find Pods/Deployments referencing this resource (read-only)
+5. Show rename plan   → print exactly what will happen
+6. --dry-run stop     → exit here if dry-run, nothing written
+7. Confirm prompt     → ask yes/no (skip with -y)
+8. CREATE new         → new resource with same data under new name
+9. DELETE old         → remove old resource
+10. Warn about refs   → remind user which resources need manual updates
+```
+
+## Partial-failure recovery
+
+If the process is interrupted (crash, Ctrl+C, network drop) after CREATE but before DELETE, both names will exist. On the next re-run, the tool detects this automatically:
+
+```
+⚠️  Partial rename detected: "app-config-v2" already exists with identical data.
+   This looks like a previous rename that was interrupted after CREATE but before DELETE.
+   Completing rename by deleting "app-config"...
+✓ Deleted ConfigMap "app-config"
+
+Done. ConfigMap renamed: "app-config" → "app-config-v2"
+```
+
+**What counts as "identical":** only `data`/`binaryData` is compared — labels and annotations are intentionally excluded. A controller adding `app.kubernetes.io/managed-by: helm` to the new resource after CREATE does not block recovery.
+
+If CREATE succeeds but DELETE fails (e.g., RBAC revoked mid-run, finalizer added):
+
+```
+⚠️  Partial rename: "app-config-v2" was created but "app-config" could not be deleted: <reason>
+   Re-run this command to finish, or manually delete "app-config"
+```
+
+Re-running the same command detects the identical data and completes the delete.
+
+`--dry-run` works on the recovery path too:
+
+```
+⚠️  Partial rename detected: "app-config-v2" already exists with identical data.
+   [dry-run] Would delete "app-config" to complete the rename. No changes made.
 ```
 
 ## What is scanned for references
@@ -90,9 +122,11 @@ The tool **never starts the rename** until all three permissions are confirmed. 
 | Pod `envFrom` | ✓ | ✓ |
 | Pod `env.valueFrom` | ✓ | ✓ |
 | Pod `imagePullSecrets` | — | ✓ |
+| Pod init containers | ✓ | ✓ |
 | Deployment volume mount | ✓ | ✓ |
 | Deployment `envFrom` | ✓ | ✓ |
 | Deployment `imagePullSecrets` | — | ✓ |
+| Deployment init containers | ✓ | ✓ |
 
 References are **read-only** — the scanner never modifies them. You are responsible for updating them after the rename.
 
@@ -109,7 +143,7 @@ All calls are scoped to the specified namespace. No cluster-wide access required
 | `list` deployments | Dependency scan (read-only) |
 | `create` selfsubjectaccessreviews | Pre-flight permission check |
 
-**No new RBAC types needed.** If you can already `get`, `create`, and `delete` a ConfigMap manually — this tool adds nothing new. It automates what you could already do by hand, just more safely.
+**No new RBAC types needed.** If you can already `get`, `create`, and `delete` a ConfigMap manually — this tool adds nothing new. It automates what you could already do by hand, safely.
 
 ## Why not just use `kubectl apply`?
 
@@ -126,34 +160,13 @@ Problems with the manual approach:
 - No dependency check → references silently break
 - No confirmation → immediate destructive action
 - No dry-run → can't preview safely
-
-## Partial-failure recovery
-
-If the process is interrupted (crash, Ctrl+C, network drop) after CREATE but before DELETE, both names will exist. On the next re-run, the tool detects this automatically:
-
-```
-⚠️  Partial rename detected: "app-config-v2" already exists with identical data.
-   This looks like a previous rename that was interrupted after CREATE but before DELETE.
-   Completing rename by deleting "app-config"...
-✓ Deleted ConfigMap "app-config"
-
-Done. ConfigMap renamed: "app-config" → "app-config-v2"
-```
-
-If CREATE succeeds but DELETE fails (e.g., RBAC revoked mid-run, finalizer added):
-
-```
-⚠️  Partial rename: "app-config-v2" was created but "app-config" could not be deleted: <reason>
-   Re-run this command to finish, or manually delete "app-config"
-```
-
-Re-running the same command will detect the identical data and complete the delete step.
+- No recovery → if interrupted halfway, no guidance on what state you're in
 
 ## Caveats
 
 - References are scanned in the specified namespace only. Cross-namespace references are not detected.
-- The rename is not atomic — there is a brief window between CREATE and DELETE where both names exist. Re-run handles this automatically (see above).
-- Deployment/StatefulSet/DaemonSet pods that mount the renamed ConfigMap/Secret will use the old data until their next rollout. The tool warns but does not trigger a rollout.
+- The rename is not atomic — brief window between CREATE and DELETE. Re-run auto-recovers (see above).
+- Workloads referencing the renamed resource continue using old data until their next rollout. The tool warns but does not trigger a rollout.
 - StatefulSets, DaemonSets, CronJobs, and CRDs are not scanned for references in v0.1.
 - init containers inside Pods and Deployments are scanned.
 
